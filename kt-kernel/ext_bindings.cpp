@@ -433,6 +433,12 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);
 
+  // Bind expert_buffer_info for MoE types that support the direct-DMA
+  // prefill reload (synchronous pointer read; no cpuinfer task needed).
+  if constexpr (requires { &MoeClass::expert_buffer_info; }) {
+    moe_cls.def("expert_buffer_info", &MoeClass::expert_buffer_info);
+  }
+
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
   if constexpr (requires { &MoeClass::write_weight_scale_to_buffer; }) {

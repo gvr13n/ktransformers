@@ -511,6 +511,28 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     for (; i < count; i++) dst[i] = ggml_fp32_to_bf16(src[i]);
   }
 
+  // Expose this expert's CPU weight/scale arena pointers so a consumer can
+  // cudaHostRegister them once and DMA the weights directly, bypassing the
+  // staged write. Valid because this backend stores b as nibble-packed FP4
+  // rows byte-identical to what write_weights_to_buffer memcpys (gate/up
+  // contiguous; down contiguous when cpu_tp_count == gpu_tp_count == 1) and
+  // d as plain fp32 group scales. Any TP slicing invalidates the shortcut;
+  // callers must check they run 1 CPU part x 1 GPU part.
+  // Returns {gate_b, up_b, down_b, gate_d, up_d, down_d, weight_bytes,
+  // scale_bytes}. Read-only after load; no thread-pool dispatch needed.
+  std::vector<uintptr_t> expert_buffer_info(int expert_id) const {
+    if (expert_id < 0 || expert_id >= config_.expert_num || gate_bb_[expert_id] == nullptr ||
+        up_bb_[expert_id] == nullptr || down_bb_[expert_id] == nullptr)
+      throw std::runtime_error("expert_buffer_info: expert has no CPU buffers");
+    size_t weight_bytes = (size_t)config_.intermediate_size * config_.hidden_size / 2;
+    size_t scale_bytes = (size_t)config_.intermediate_size * config_.hidden_size /
+                         config_.quant_config.group_size * sizeof(float);
+    return {(uintptr_t)gate_bb_[expert_id]->b, (uintptr_t)up_bb_[expert_id]->b,
+            (uintptr_t)down_bb_[expert_id]->b, (uintptr_t)gate_bb_[expert_id]->d,
+            (uintptr_t)up_bb_[expert_id]->d,   (uintptr_t)down_bb_[expert_id]->d,
+            (uintptr_t)weight_bytes,           (uintptr_t)scale_bytes};
+  }
+
   void write_weights_to_buffer(int gpu_tp_count, int cpu_tp_count, int expert_id, const GeneralMOEConfig& full_config,
                                const std::vector<uintptr_t>& w13_weight_ptrs,
                                const std::vector<uintptr_t>& w13_scale_ptrs,
@@ -820,6 +842,17 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,
                                             w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
     });
+  }
+
+  // Per-part arena pointers for the direct-DMA prefill reload; one inner
+  // vector per CPU TP part (see the per-part method for layout guarantees).
+  std::vector<std::vector<uintptr_t>> expert_buffer_info(int expert_id) {
+    if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
+    if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
+    std::vector<std::vector<uintptr_t>> out;
+    out.reserve(this->tps.size());
+    for (size_t i = 0; i < this->tps.size(); i++) out.push_back(this->tps[i]->expert_buffer_info(expert_id));
+    return out;
   }
 };
 

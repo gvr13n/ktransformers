@@ -963,3 +963,22 @@ class NativeMoEWrapper(BaseMoEWrapper):
         """
         # The CPUInfer.sync() call blocks until pending tasks complete.
         self.cpu_infer.sync()
+
+    def expert_buffer_info(self, expert_id: int):
+        """Per-part arena pointers/sizes for one expert's CPU weights.
+
+        Returns a list with one entry per CPU TP part, each
+        [gate_b, up_b, down_b, gate_d, up_d, down_d, weight_bytes, scale_bytes]
+        (b = nibble-packed FP4 bytes, byte-identical to what
+        write_weight_scale_to_buffer would produce for the weight regions at
+        1 CPU part x 1 GPU part; d = fp32 group scales). Consumers may
+        cudaHostRegister the regions once and DMA directly, skipping the
+        staged write. Only meaningful for backends that expose it (MXFP4
+        AVX-512 path); callers must check availability with hasattr/try.
+        Synchronous read; safe after weights are loaded.
+        """
+        if self.moe is None:
+            raise RuntimeError("MoE instance not initialized; cannot query expert_buffer_info.")
+        if not hasattr(self.moe, "expert_buffer_info"):
+            raise NotImplementedError("expert_buffer_info is not available for this backend implementation.")
+        return self.moe.expert_buffer_info(expert_id)

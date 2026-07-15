@@ -180,6 +180,12 @@ class AMX_MOE_BASE {
     derived_const()->write_weights_to_buffer(std::forward<Args>(args)...);
   }
 
+  // CRTP forwarder for backends exposing direct-DMA arena pointers (only
+  // instantiated when a TP_MOE specialization actually calls it).
+  std::vector<uintptr_t> expert_buffer_info(int expert_id) const {
+    return derived_const()->expert_buffer_info(expert_id);
+  }
+
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
                        void* output) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
