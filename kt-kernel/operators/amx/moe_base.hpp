@@ -62,6 +62,14 @@ class AMX_MOE_BASE {
   std::vector<std::shared_ptr<typename T::BufferB>> down_bb_;
   std::vector<std::shared_ptr<typename T::BufferC>> down_bc_;
 
+  // Per-layer contiguous weight slab (see init()): all resident experts'
+  // BufferB storage in one allocation, expert-id ascending order.
+  void* weight_slab_ = nullptr;
+  size_t weight_slab_stride_ = 0;    // bytes per expert block
+  size_t weight_slab_blk_gu_ = 0;    // 64B-aligned gate/up BufferB size
+  size_t weight_slab_blk_down_ = 0;  // 64B-aligned down BufferB size
+  std::vector<int> weight_slab_experts_;  // logical expert ids, slab order
+
   size_t pool_count_ = 0;
   size_t gate_up_ba_pool_bytes_ = 0;
   size_t gate_bc_pool_bytes_ = 0;
@@ -110,6 +118,27 @@ class AMX_MOE_BASE {
     m_local_up_output_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
 
+    // Weight (BufferB) storage: one contiguous slab per layer instead of three
+    // aligned_alloc's per expert. Layout per resident expert: [gate | up | down],
+    // each block 64B-aligned, weight+scale contiguity inside a block unchanged
+    // (BufferB just points into the slab). A contiguous slab lets the GPU
+    // prefill reload be one bulk H2D per layer instead of ~700 small copies.
+    const size_t bb_sz_gu = buffer_b_required_size(config_.intermediate_size, config_.hidden_size);
+    const size_t bb_sz_down = buffer_b_required_size(config_.hidden_size, config_.intermediate_size);
+    auto align64 = [](size_t s) { return (s + size_t(63)) & ~size_t(63); };
+    weight_slab_blk_gu_ = align64(bb_sz_gu);
+    weight_slab_blk_down_ = align64(bb_sz_down);
+    weight_slab_stride_ = 2 * weight_slab_blk_gu_ + weight_slab_blk_down_;
+    for (size_t i = 0; i < config_.expert_num; i++) {
+      if (!(config_.skip_gpu_expert_cpu_copy && config_.should_skip_expert((int64_t)i))) {
+        weight_slab_experts_.push_back((int)i);
+      }
+    }
+    if (!weight_slab_experts_.empty()) {
+      weight_slab_ = std::aligned_alloc(64, weight_slab_stride_ * weight_slab_experts_.size());
+    }
+
+    size_t slab_pos = 0;
     for (size_t i = 0; i < config_.expert_num; i++) {
       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.hidden_size, nullptr));
       gate_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
@@ -117,16 +146,18 @@ class AMX_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
-      void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
-      gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
+      if (config_.skip_gpu_expert_cpu_copy && config_.should_skip_expert((int64_t)i)) {
+        gate_bb_.push_back(nullptr);
+        up_bb_.push_back(nullptr);
+        down_bb_.push_back(nullptr);
+        continue;
+      }
 
-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
-      up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
-
-      void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
-      down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
+      char* blk = (char*)weight_slab_ + weight_slab_stride_ * slab_pos++;
+      gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, blk));
+      up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, blk + weight_slab_blk_gu_));
+      down_bb_.push_back(
+          make_buffer_b(config_.hidden_size, config_.intermediate_size, blk + 2 * weight_slab_blk_gu_));
     }
     // TODO: need update to all *.hpp
     // (config_.expert_num * T::M_STEP) in pool_count_ is to ensure padding for each experts.
@@ -184,6 +215,18 @@ class AMX_MOE_BASE {
   // instantiated when a TP_MOE specialization actually calls it).
   std::vector<uintptr_t> expert_buffer_info(int expert_id) const {
     return derived_const()->expert_buffer_info(expert_id);
+  }
+
+  // Layer-level view of the weight slab for bulk-DMA consumers:
+  // {slab_base, stride, blk_gu, blk_down, n_experts, expert_id_0, ...}.
+  // Combine with expert_buffer_info(expert_id_0) for weight/scale byte
+  // splits; per-projection offsets inside a block are 0 / blk_gu / 2*blk_gu.
+  std::vector<uintptr_t> layer_buffer_info() const {
+    std::vector<uintptr_t> out = {(uintptr_t)weight_slab_, (uintptr_t)weight_slab_stride_,
+                                  (uintptr_t)weight_slab_blk_gu_, (uintptr_t)weight_slab_blk_down_,
+                                  (uintptr_t)weight_slab_experts_.size()};
+    for (int e : weight_slab_experts_) out.push_back((uintptr_t)e);
+    return out;
   }
 
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,

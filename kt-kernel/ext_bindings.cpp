@@ -438,6 +438,9 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
   if constexpr (requires { &MoeClass::expert_buffer_info; }) {
     moe_cls.def("expert_buffer_info", &MoeClass::expert_buffer_info);
   }
+  if constexpr (requires { &MoeClass::layer_buffer_info; }) {
+    moe_cls.def("layer_buffer_info", &MoeClass::layer_buffer_info);
+  }
 
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
@@ -715,6 +718,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
           "gpu_experts_mask",
           [](const GeneralMOEConfig& self) { return reinterpret_cast<uintptr_t>(self.gpu_experts_mask); },
           [](GeneralMOEConfig& self, uintptr_t val) { self.gpu_experts_mask = reinterpret_cast<uint8_t*>(val); })
+      .def_readwrite("skip_gpu_expert_cpu_copy", &GeneralMOEConfig::skip_gpu_expert_cpu_copy)
       .DEF_PTR_PROPERTY(GeneralMOEConfig, physical_to_logical_map)
 
       .DEF_PTR_PROPERTY(GeneralMOEConfig, gate_proj)
